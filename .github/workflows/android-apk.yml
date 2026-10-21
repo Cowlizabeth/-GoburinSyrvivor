@@ -1,0 +1,194 @@
+
+name: Build Goblin Survivor APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare game
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build
+
+          if [ -f project.godot ]; then
+            echo "GAME_DIR=." >> "$GITHUB_ENV"
+          elif [ -f GoblinZombieSurvivor-v2.zip ]; then
+            mkdir -p game
+            unzip -q -o GoblinZombieSurvivor-v2.zip -d game
+            echo "GAME_DIR=game" >> "$GITHUB_ENV"
+          else
+            echo "Game project not found"
+            exit 1
+          fi
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          SDK="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          "$SDK" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Install Godot 4.4.1
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="https://github.com/godotengine/godot/releases/download/4.4.1-stable"
+
+          curl -fL --retry 3 \
+            -o /tmp/godot.zip \
+            "$BASE/Godot_v4.4.1-stable_linux.x86_64.zip"
+
+          sudo unzip -q /tmp/godot.zip -d /usr/local/bin
+
+          sudo mv \
+            /usr/local/bin/Godot_v4.4.1-stable_linux.x86_64 \
+            /usr/local/bin/godot
+
+          sudo chmod +x /usr/local/bin/godot
+
+          curl -fL --retry 3 \
+            -o /tmp/templates.tpz \
+            "$BASE/Godot_v4.4.1-stable_export_templates.tpz"
+
+          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/4.4.1.stable"
+          mkdir -p "$TEMPLATE_DIR"
+          mkdir -p /tmp/godot-templates
+
+          unzip -q /tmp/templates.tpz \
+            "templates/android_debug.apk" \
+            "templates/android_release.apk" \
+            "templates/version.txt" \
+            -d /tmp/godot-templates
+
+          cp /tmp/godot-templates/templates/* "$TEMPLATE_DIR/"
+
+          godot --version
+
+      - name: Configure Android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.config/godot"
+          mkdir -p "$HOME/.android"
+
+          SETTINGS="$HOME/.config/godot/editor_settings-4.4.tres"
+
+          cat > "$SETTINGS" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/debug_keystore = "$HOME/.android/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+
+          keytool -genkeypair \
+            -keystore "$HOME/.android/debug.keystore" \
+            -alias androiddebugkey \
+            -storepass android \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$HOME/.android/debug.keystore" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+
+      - name: Validate project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$GAME_DIR/project.godot"
+          test -f "$GAME_DIR/main.tscn"
+          test -f "$GAME_DIR/game.gd"
+          test -f "$GAME_DIR/export_presets.cfg"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          path = Path(os.environ["GAME_DIR"]) / "project.godot"
+          data = path.read_text()
+
+          setting = "textures/vram_compression/import_etc2_astc=true"
+
+          if setting not in data:
+              if "[rendering]" in data:
+                  data = data.replace(
+                      "[rendering]",
+                      "[rendering]\n" + setting,
+                      1
+                  )
+              else:
+                  data += "\n[rendering]\n" + setting + "\n"
+
+          path.write_text(data)
+          PY
+
+      - name: Import game assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          godot --headless \
+            --path "$GAME_DIR" \
+            --editor \
+            --import \
+            --quit
+
+      - name: Build Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          godot --headless --verbose \
+            --path "$GAME_DIR" \
+            --export-debug "Android" \
+            "$GITHUB_WORKSPACE/build/GoblinSurvivor-debug.apk"
+
+          test -s build/GoblinSurvivor-debug.apk
+          unzip -tq build/GoblinSurvivor-debug.apk
+          ls -lh build/GoblinSurvivor-debug.apk
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoblinSurvivor-Android
+          path: build/GoblinSurvivor-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+          

@@ -14,28 +14,49 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare game
+      - name: Find and unpack game
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p build
 
           if [ -f project.godot ]; then
-            echo "GAME_DIR=." >> "$GITHUB_ENV"
-          elif [ -f GoblinZombieSurvivor-v2.zip ]; then
-            mkdir -p game
-            unzip -q -o GoblinZombieSurvivor-v2.zip -d game
-            echo "GAME_DIR=game" >> "$GITHUB_ENV"
+            GAME_DIR="$PWD"
           else
-            echo "Game project not found"
-            exit 1
+            ARCHIVE=$(find . -maxdepth 1 \
+              -type f -name '*.zip' \
+              | sort -V | tail -n 1)
+
+            if [ -z "$ARCHIVE" ]; then
+              echo "ERROR: No game ZIP found"
+              exit 1
+            fi
+
+            echo "Using archive: $ARCHIVE"
+            mkdir -p extracted
+            unzip -q -o "$ARCHIVE" -d extracted
+
+            PROJECT=$(find extracted \
+              -type f -name project.godot \
+              -print -quit)
+
+            if [ -z "$PROJECT" ]; then
+              echo "ERROR: project.godot not found"
+              exit 1
+            fi
+
+            GAME_DIR="$PWD/$(dirname "$PROJECT")"
           fi
 
-      - name: Install Java 17
+          echo "GAME_DIR=$GAME_DIR" >> "$GITHUB_ENV"
+          test -f "$GAME_DIR/main.tscn"
+          test -f "$GAME_DIR/export_presets.cfg"
+          echo "Project found: $GAME_DIR"
+
+      - name: Install Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -48,14 +69,12 @@ jobs:
 
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
 
-          SDK="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-
-          "$SDK" \
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      - name: Install Godot 4.4.1
+      - name: Install Godot
         shell: bash
         run: |
           set -euo pipefail
@@ -67,28 +86,26 @@ jobs:
             "$BASE/Godot_v4.4.1-stable_linux.x86_64.zip"
 
           sudo unzip -q /tmp/godot.zip -d /usr/local/bin
-
           sudo mv \
             /usr/local/bin/Godot_v4.4.1-stable_linux.x86_64 \
             /usr/local/bin/godot
-
           sudo chmod +x /usr/local/bin/godot
 
           curl -fL --retry 3 \
             -o /tmp/templates.tpz \
             "$BASE/Godot_v4.4.1-stable_export_templates.tpz"
 
-          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/4.4.1.stable"
-          mkdir -p "$TEMPLATE_DIR"
-          mkdir -p /tmp/godot-templates
+          mkdir -p /tmp/templates
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.4.1.stable"
 
           unzip -q /tmp/templates.tpz \
             "templates/android_debug.apk" \
             "templates/android_release.apk" \
             "templates/version.txt" \
-            -d /tmp/godot-templates
+            -d /tmp/templates
 
-          cp /tmp/godot-templates/templates/* "$TEMPLATE_DIR/"
+          cp /tmp/templates/templates/* \
+            "$HOME/.local/share/godot/export_templates/4.4.1.stable/"
 
           godot --version
 
@@ -127,22 +144,19 @@ jobs:
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
 
-      - name: Validate project
+      - name: Configure game
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f "$GAME_DIR/project.godot"
-          test -f "$GAME_DIR/main.tscn"
-          test -f "$GAME_DIR/game.gd"
-          test -f "$GAME_DIR/export_presets.cfg"
-
           python3 - <<'PY'
           from pathlib import Path
           import os
+          import re
 
-          path = Path(os.environ["GAME_DIR"]) / "project.godot"
-          data = path.read_text()
+          root = Path(os.environ["GAME_DIR"])
+          project = root / "project.godot"
+          data = project.read_text()
 
           setting = "textures/vram_compression/import_etc2_astc=true"
 
@@ -156,21 +170,68 @@ jobs:
               else:
                   data += "\n[rendering]\n" + setting + "\n"
 
-          path.write_text(data)
+          project.write_text(data)
+
+          preset = root / "export_presets.cfg"
+          text = preset.read_text()
+
+          values = {
+              "keystore/debug": str(Path.home() / ".android/debug.keystore"),
+              "keystore/debug_user": "androiddebugkey",
+              "keystore/debug_password": "android",
+          }
+
+          for key, value in values.items():
+              pattern = r"(?m)^" + re.escape(key) + r"=.*$"
+              replacement = key + '="' + value + '"'
+
+              if re.search(pattern, text):
+                  text = re.sub(
+                      pattern,
+                      lambda _: replacement,
+                      text
+                  )
+
+          preset.write_text(text)
+          print("Android settings prepared")
           PY
 
-      - name: Import game assets
+      - name: Import resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          godot --headless \
+            --path "$GAME_DIR" \
+            --editor --import --quit
+
+      - name: Check scene startup
         shell: bash
         run: |
           set -euo pipefail
 
-          godot --headless \
+          set +e
+          timeout 15s godot --headless \
             --path "$GAME_DIR" \
-            --editor \
-            --import \
-            --quit
+            --quit-after 60 \
+            > /tmp/game-check.log 2>&1
+          RESULT=$?
+          set -e
 
-      - name: Build Android APK
+          cat /tmp/game-check.log
+
+          if grep -E \
+            'SCRIPT ERROR|Parse Error|Failed to load|ERROR:' \
+            /tmp/game-check.log; then
+            echo "Game startup errors detected"
+            exit 1
+          fi
+
+          if [ "$RESULT" -ne 0 ]; then
+            echo "Game startup failed: $RESULT"
+            exit 1
+          fi
+
+      - name: Build APK
         shell: bash
         run: |
           set -euo pipefail
@@ -178,17 +239,15 @@ jobs:
           godot --headless --verbose \
             --path "$GAME_DIR" \
             --export-debug "Android" \
-            "$GITHUB_WORKSPACE/build/GoblinSurvivor-debug.apk"
+            "$GITHUB_WORKSPACE/build/GoblinSurvivor.apk"
 
-          test -s build/GoblinSurvivor-debug.apk
-          unzip -tq build/GoblinSurvivor-debug.apk
-          ls -lh build/GoblinSurvivor-debug.apk
+          test -s build/GoblinSurvivor.apk
+          unzip -tq build/GoblinSurvivor.apk
 
-      - name: Upload Android APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: GoblinSurvivor-Android
-          path: build/GoblinSurvivor-debug.apk
+          path: build/GoblinSurvivor.apk
           if-no-files-found: error
-          retention-days: 14
           

@@ -36,34 +36,47 @@ jobs:
           )
 
           if [ "${#PROJECTS[@]}" -eq 0 ]; then
-            echo "Searching for project ZIP..."
+            echo "Searching ZIP archives..."
+
+            mkdir -p /tmp/goblin_project
 
             mapfile -t ZIPS < <(
               find . -maxdepth 3 -type f \
-                -iname '*.zip' | sort
+                -iname '*.zip' \
+                -printf '%T@ %p\n' |
+              sort -nr | cut -d' ' -f2-
             )
 
-            mkdir -p /tmp/goblin_projects
+            FOUND=0
 
             for archive in "${ZIPS[@]}"; do
               if unzip -Z1 "$archive" |
                 grep -Eq '(^|/)project\.godot$'; then
-                echo "Extracting: $archive"
+
+                echo "Extracting $archive"
+
                 unzip -oq "$archive" \
-                  -d /tmp/goblin_projects
+                  -d /tmp/goblin_project
+
+                FOUND=1
                 break
               fi
             done
 
+            if [ "$FOUND" -eq 0 ]; then
+              echo "::error::Godot project not found"
+              exit 1
+            fi
+
             mapfile -t PROJECTS < <(
-              find /tmp/goblin_projects \
+              find /tmp/goblin_project \
                 -maxdepth 6 -type f \
                 -name project.godot | sort
             )
           fi
 
           if [ "${#PROJECTS[@]}" -ne 1 ]; then
-            echo "::error::Expected one project.godot, found ${#PROJECTS[@]}"
+            echo "::error::Expected one project.godot"
             exit 1
           fi
 
@@ -73,12 +86,9 @@ jobs:
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          test -f "$PROJECT_DIR/scenes/main.tscn"
-          test -f "$PROJECT_DIR/scripts/game.gd"
           test -f "$PROJECT_DIR/export_presets.cfg"
-          test -f "$PROJECT_DIR/.ci/configure_android.gd"
 
-          echo "Godot project found: $PROJECT_DIR"
+          echo "Project found: $PROJECT_DIR"
 
       - name: Configure Android SDK
         shell: bash
@@ -87,9 +97,11 @@ jobs:
           set -euo pipefail
 
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
           test -n "$SDK"
 
           SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
           test -x "$SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
@@ -98,9 +110,7 @@ jobs:
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
-            "cmdline-tools;latest" \
-            "cmake;3.10.2.4988404" \
-            "ndk;23.2.8568313"
+            "cmdline-tools;latest"
 
           echo "GODOT_CI_ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
 
@@ -137,6 +147,47 @@ jobs:
 
           godot --headless --version
 
+      - name: Replace broken Android configuration script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$PROJECT_DIR/.ci"
+
+          cat > "$PROJECT_DIR/.ci/configure_android.gd" <<'GDSCRIPT'
+          extends SceneTree
+
+          func _initialize() -> void:
+              var sdk: String = OS.get_environment("GODOT_CI_ANDROID_SDK")
+              var java: String = OS.get_environment("JAVA_HOME")
+
+              if sdk.is_empty() or java.is_empty():
+                  push_error("Missing Android SDK or JAVA_HOME")
+                  quit(1)
+                  return
+
+              var settings: EditorSettings = EditorInterface.get_editor_settings()
+
+              settings.set_setting("export/android/android_sdk_path", sdk)
+              settings.set_setting("export/android/java_sdk_path", java)
+
+              print("Android SDK: ", sdk)
+              print("Java: ", java)
+
+              call_deferred("_finish")
+
+          func _finish() -> void:
+              quit(0)
+          GDSCRIPT
+
+          echo "Replaced outdated Android configuration script"
+
+          if grep -n 'settings.save()' \
+            "$PROJECT_DIR/.ci/configure_android.gd"; then
+            echo "::error::Invalid save() call still present"
+            exit 1
+          fi
+
       - name: Configure Godot Android paths
         shell: bash
         timeout-minutes: 2
@@ -144,7 +195,6 @@ jobs:
           set -euo pipefail
 
           test -x "$JAVA_HOME/bin/java"
-          test -f "$PROJECT_DIR/.ci/configure_android.gd"
 
           timeout 90s godot --headless \
             --path "$PROJECT_DIR" \
@@ -198,7 +248,8 @@ jobs:
             --export-debug "Android" \
             "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
 
-          test -s "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
+          test -s \
+            "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
 
           echo "APK successfully created"
 

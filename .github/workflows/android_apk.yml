@@ -8,259 +8,249 @@ on:
 
 jobs:
   android:
-    name: Build Android APK
     runs-on: ubuntu-22.04
     timeout-minutes: 30
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Java 17
+      - name: Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Find Godot project
+      - name: Find project (also supports uploaded ZIP)
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t PROJECTS < <(
+          mapfile -t projects < <(
             find . -maxdepth 6 -type f \
               -name project.godot \
               -not -path '*/.godot/*' | sort
           )
 
-          if [ "${#PROJECTS[@]}" -eq 0 ]; then
-            mkdir -p /tmp/goblin_project
+          if [ ${#projects[@]} -eq 0 ]; then
+            mkdir -p /tmp/goblin_source
 
-            mapfile -t ZIPS < <(
+            mapfile -t archives < <(
               find . -maxdepth 3 -type f \
-                -iname '*.zip' \
-                -printf '%T@ %p\n' |
-              sort -nr | cut -d' ' -f2-
+                -iname '*.zip' -printf '%T@ %p\n' |
+              sort -rn | cut -d' ' -f2-
             )
 
-            FOUND=0
-
-            for archive in "${ZIPS[@]}"; do
+            for archive in "${archives[@]}"; do
               if unzip -Z1 "$archive" |
                 grep -Eq '(^|/)project\.godot$'; then
-                echo "Extracting $archive"
-                unzip -oq "$archive" \
-                  -d /tmp/goblin_project
-                FOUND=1
+                unzip -qo "$archive" -d /tmp/goblin_source
                 break
               fi
             done
 
-            if [ "$FOUND" -eq 0 ]; then
-              echo "::error::Godot project not found"
-              exit 1
-            fi
-
-            mapfile -t PROJECTS < <(
-              find /tmp/goblin_project \
-                -maxdepth 6 -type f \
-                -name project.godot | sort
+            mapfile -t projects < <(
+              find /tmp/goblin_source -maxdepth 6 \
+                -type f -name project.godot | sort
             )
           fi
 
-          if [ "${#PROJECTS[@]}" -ne 1 ]; then
-            echo "::error::Expected exactly one project.godot"
+          if [ ${#projects[@]} -ne 1 ]; then
+            echo "::error::Exactly one Godot project required"
             exit 1
           fi
 
-          PROJECT_DIR="$(
-            cd "$(dirname "${PROJECTS[0]}")" && pwd
-          )"
+          dir="$(cd "$(dirname "${projects[0]}")" && pwd)"
+          echo "PROJECT_DIR=$dir" >> "$GITHUB_ENV"
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          test -f "$dir/export_presets.cfg"
+          test -f "$dir/scenes/main.tscn"
 
-          test -f "$PROJECT_DIR/export_presets.cfg"
-          test -f "$PROJECT_DIR/scenes/main.tscn"
+          echo "Using project: $dir"
 
-          echo "Project: $PROJECT_DIR"
-
-      - name: Install complete Android SDK
+      - name: Android SDK
+        timeout-minutes: 7
         shell: bash
-        timeout-minutes: 8
         run: |
           set -euo pipefail
 
-          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          test -n "$SDK"
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -x "$sdk/cmdline-tools/latest/bin/sdkmanager"
 
-          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          test -x "$SDKMANAGER"
+          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" \
+            --licenses >/dev/null || true
 
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$sdk/cmdline-tools/latest/bin/sdkmanager" \
+            'platform-tools' \
+            'platforms;android-34' \
+            'build-tools;34.0.0' \
+            'platforms;android-35' \
+            'build-tools;35.0.0' \
+            'cmake;3.10.2.4988404' \
+            'ndk;23.2.8568313'
 
-          "$SDKMANAGER" \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "cmdline-tools;latest" \
-            "cmake;3.10.2.4988404" \
-            "ndk;23.2.8568313"
+          echo "GODOT_CI_ANDROID_SDK=$sdk" >> "$GITHUB_ENV"
 
-          test -f "$SDK/platform-tools/adb"
-          test -f "$SDK/platforms/android-34/android.jar"
-          test -f "$SDK/build-tools/34.0.0/aapt2"
-          test -d "$SDK/ndk/23.2.8568313"
-          test -d "$SDK/cmake/3.10.2.4988404"
-
-          echo "GODOT_CI_ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
-
-          echo "Android SDK ready"
-
-      - name: Install Godot 4.4.1
-        shell: bash
+      - name: Godot 4.4.1 and Android templates
         timeout-minutes: 6
+        shell: bash
         run: |
           set -euo pipefail
 
-          VERSION=4.4.1
+          version=4.4.1
 
           wget -q \
-            "https://github.com/godotengine/godot/releases/download/${VERSION}-stable/Godot_v${VERSION}-stable_linux.x86_64.zip" \
+            "https://github.com/godotengine/godot/releases/download/${version}-stable/Godot_v${version}-stable_linux.x86_64.zip" \
             -O /tmp/godot.zip
 
-          unzip -q /tmp/godot.zip -d /tmp
+          unzip -qo /tmp/godot.zip -d /tmp
 
           sudo install -m755 \
-            "/tmp/Godot_v${VERSION}-stable_linux.x86_64" \
+            "/tmp/Godot_v${version}-stable_linux.x86_64" \
             /usr/local/bin/godot
 
           wget -q \
-            "https://github.com/godotengine/godot/releases/download/${VERSION}-stable/Godot_v${VERSION}-stable_export_templates.tpz" \
+            "https://github.com/godotengine/godot/releases/download/${version}-stable/Godot_v${version}-stable_export_templates.tpz" \
             -O /tmp/templates.tpz
 
-          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/${VERSION}.stable"
+          mkdir -p \
+            "$HOME/.local/share/godot/export_templates/${version}.stable" \
+            /tmp/godot_templates
 
-          mkdir -p "$TEMPLATE_DIR"
-          unzip -q /tmp/templates.tpz -d /tmp/godot_templates
-          cp /tmp/godot_templates/templates/* "$TEMPLATE_DIR/"
+          unzip -qo /tmp/templates.tpz -d /tmp/godot_templates
 
-          test -f "$TEMPLATE_DIR/android_debug.apk"
-          godot --headless --version
+          cp /tmp/godot_templates/templates/* \
+            "$HOME/.local/share/godot/export_templates/${version}.stable/"
 
-      - name: Configure Godot Android
+          test -f \
+            "$HOME/.local/share/godot/export_templates/${version}.stable/android_debug.apk"
+
+      - name: Configure editor and debug signing
+        timeout-minutes: 3
         shell: bash
-        timeout-minutes: 2
         run: |
           set -euo pipefail
 
-          mkdir -p "$PROJECT_DIR/.ci"
+          mkdir -p "$PROJECT_DIR/.ci" "$HOME/.android"
 
           cat > "$PROJECT_DIR/.ci/configure_android.gd" <<'GDSCRIPT'
           extends SceneTree
 
           func _initialize() -> void:
-              var sdk: String = OS.get_environment("GODOT_CI_ANDROID_SDK")
-              var java: String = OS.get_environment("JAVA_HOME")
-
-              if sdk.is_empty() or java.is_empty():
-                  push_error("Missing SDK or JAVA_HOME")
-                  quit(1)
-                  return
-
               var settings: EditorSettings = EditorInterface.get_editor_settings()
-
-              settings.set_setting("export/android/android_sdk_path", sdk)
-              settings.set_setting("export/android/java_sdk_path", java)
-
-              print("Configured SDK: ", sdk)
-              print("Configured Java: ", java)
-
-              call_deferred("_finish")
-
-          func _finish() -> void:
+              settings.set_setting("export/android/android_sdk_path", OS.get_environment("GODOT_CI_ANDROID_SDK"))
+              settings.set_setting("export/android/java_sdk_path", OS.get_environment("JAVA_HOME"))
+              print("Android SDK: ", settings.get_setting("export/android/android_sdk_path"))
+              print("Java SDK: ", settings.get_setting("export/android/java_sdk_path"))
               quit(0)
           GDSCRIPT
 
-          timeout 90s godot --headless \
+          timeout 75s godot --headless \
             --path "$PROJECT_DIR" \
             --editor \
             --script "$PROJECT_DIR/.ci/configure_android.gd"
 
-          echo "Android configuration finished"
+          settings_file="$HOME/.config/godot/editor_settings-4.4.tres"
 
-      - name: Generate debug keystore
-        shell: bash
-        run: |
-          set -euo pipefail
+          test -s "$settings_file"
+
+          grep -F 'export/android/android_sdk_path' \
+            "$settings_file" || true
+
+          grep -F 'export/android/java_sdk_path' \
+            "$settings_file" || true
 
           keytool -genkeypair -noprompt \
-            -keystore "$RUNNER_TEMP/debug.keystore" \
+            -keystore "$HOME/.android/debug.keystore" \
             -alias androiddebugkey \
             -storepass android \
             -keypass android \
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
-            -dname "CN=Android Debug,O=Goblin Defense,C=US"
+            -dname 'CN=Android Debug,O=Goblin Defense,C=US'
 
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$HOME/.android/debug.keystore" >> "$GITHUB_ENV"
+          echo 'GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey' >> "$GITHUB_ENV"
+          echo 'GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android' >> "$GITHUB_ENV"
 
-      - name: Import game resources
-        shell: bash
+          cat > "$PROJECT_DIR/export_presets.cfg" <<'PRESET'
+          [preset.0]
+          name="Android"
+          platform="Android"
+          runnable=true
+          advanced_options=false
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/GoblinDefense-debug.apk"
+
+          [preset.0.options]
+          custom_template/debug=""
+          custom_template/release=""
+          gradle_build/use_gradle_build=false
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=true
+          package/unique_name="org.goblindefense.prototype"
+          package/name="Goblin Defense"
+          package/version_code=1
+          package/version_string="0.1.1"
+          package/min_sdk=23
+          package/target_sdk=34
+          keystore/debug=""
+          keystore/debug_user=""
+          keystore/debug_password=""
+          PRESET
+
+      - name: Import assets
         timeout-minutes: 3
         run: |
-          set -euo pipefail
-
           timeout 150s godot --headless \
             --path "$PROJECT_DIR" \
             --editor --import --quit
 
-      - name: Export Android APK
-        shell: bash
+      - name: Export APK and retain error log
         timeout-minutes: 10
+        shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p "$GITHUB_WORKSPACE/build"
 
-          echo "Starting Android export with verbose logging"
-
           set +e
+
           timeout 540s godot --headless --verbose \
             --path "$PROJECT_DIR" \
-            --export-debug "Android" \
+            --export-debug Android \
             "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk" \
             2>&1 | tee "$GITHUB_WORKSPACE/build/export.log"
 
-          RESULT=${PIPESTATUS[0]}
+          rc=${PIPESTATUS[0]}
           set -e
 
-          if [ "$RESULT" -ne 0 ]; then
-            echo "::error::Godot export failed with code $RESULT"
-            exit "$RESULT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Godot export failed: $rc"
+            exit "$rc"
           fi
 
-          test -s "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
-
-          echo "APK successfully built"
+          test -s \
+            "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
 
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: GoblinDefense-Android-APK
+          name: GoblinDefense-APK
           path: build/GoblinDefense-debug.apk
           if-no-files-found: error
-          retention-days: 7
 
-      - name: Upload diagnostic log
+      - name: Upload build log if failed
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: GoblinDefense-Build-Log
+          name: GoblinDefense-export-log
           path: build/export.log
           if-no-files-found: ignore
-          retention-days: 7
           

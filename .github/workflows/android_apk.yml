@@ -4,15 +4,13 @@ name: Goblin Defense Android APK
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
 jobs:
   android:
     name: Build Android APK
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -24,7 +22,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Find or unpack Godot project
+      - name: Find Godot project
         shell: bash
         run: |
           set -euo pipefail
@@ -36,8 +34,6 @@ jobs:
           )
 
           if [ "${#PROJECTS[@]}" -eq 0 ]; then
-            echo "Searching ZIP archives..."
-
             mkdir -p /tmp/goblin_project
 
             mapfile -t ZIPS < <(
@@ -52,12 +48,9 @@ jobs:
             for archive in "${ZIPS[@]}"; do
               if unzip -Z1 "$archive" |
                 grep -Eq '(^|/)project\.godot$'; then
-
                 echo "Extracting $archive"
-
                 unzip -oq "$archive" \
                   -d /tmp/goblin_project
-
                 FOUND=1
                 break
               fi
@@ -76,7 +69,7 @@ jobs:
           fi
 
           if [ "${#PROJECTS[@]}" -ne 1 ]; then
-            echo "::error::Expected one project.godot"
+            echo "::error::Expected exactly one project.godot"
             exit 1
           fi
 
@@ -87,21 +80,20 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
           test -f "$PROJECT_DIR/export_presets.cfg"
+          test -f "$PROJECT_DIR/scenes/main.tscn"
 
-          echo "Project found: $PROJECT_DIR"
+          echo "Project: $PROJECT_DIR"
 
-      - name: Configure Android SDK
+      - name: Install complete Android SDK
         shell: bash
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: |
           set -euo pipefail
 
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-
           test -n "$SDK"
 
           SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-
           test -x "$SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
@@ -110,13 +102,23 @@ jobs:
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
-            "cmdline-tools;latest"
+            "cmdline-tools;latest" \
+            "cmake;3.10.2.4988404" \
+            "ndk;23.2.8568313"
+
+          test -f "$SDK/platform-tools/adb"
+          test -f "$SDK/platforms/android-34/android.jar"
+          test -f "$SDK/build-tools/34.0.0/aapt2"
+          test -d "$SDK/ndk/23.2.8568313"
+          test -d "$SDK/cmake/3.10.2.4988404"
 
           echo "GODOT_CI_ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
 
+          echo "Android SDK ready"
+
       - name: Install Godot 4.4.1
         shell: bash
-        timeout-minutes: 5
+        timeout-minutes: 6
         run: |
           set -euo pipefail
 
@@ -136,19 +138,18 @@ jobs:
             "https://github.com/godotengine/godot/releases/download/${VERSION}-stable/Godot_v${VERSION}-stable_export_templates.tpz" \
             -O /tmp/templates.tpz
 
-          mkdir -p \
-            "$HOME/.local/share/godot/export_templates/${VERSION}.stable"
+          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/${VERSION}.stable"
 
-          unzip -q /tmp/templates.tpz \
-            -d /tmp/godot_templates
+          mkdir -p "$TEMPLATE_DIR"
+          unzip -q /tmp/templates.tpz -d /tmp/godot_templates
+          cp /tmp/godot_templates/templates/* "$TEMPLATE_DIR/"
 
-          cp /tmp/godot_templates/templates/* \
-            "$HOME/.local/share/godot/export_templates/${VERSION}.stable/"
-
+          test -f "$TEMPLATE_DIR/android_debug.apk"
           godot --headless --version
 
-      - name: Replace broken Android configuration script
+      - name: Configure Godot Android
         shell: bash
+        timeout-minutes: 2
         run: |
           set -euo pipefail
 
@@ -162,7 +163,7 @@ jobs:
               var java: String = OS.get_environment("JAVA_HOME")
 
               if sdk.is_empty() or java.is_empty():
-                  push_error("Missing Android SDK or JAVA_HOME")
+                  push_error("Missing SDK or JAVA_HOME")
                   quit(1)
                   return
 
@@ -171,8 +172,8 @@ jobs:
               settings.set_setting("export/android/android_sdk_path", sdk)
               settings.set_setting("export/android/java_sdk_path", java)
 
-              print("Android SDK: ", sdk)
-              print("Java: ", java)
+              print("Configured SDK: ", sdk)
+              print("Configured Java: ", java)
 
               call_deferred("_finish")
 
@@ -180,32 +181,15 @@ jobs:
               quit(0)
           GDSCRIPT
 
-          echo "Replaced outdated Android configuration script"
-
-          if grep -n 'settings.save()' \
-            "$PROJECT_DIR/.ci/configure_android.gd"; then
-            echo "::error::Invalid save() call still present"
-            exit 1
-          fi
-
-      - name: Configure Godot Android paths
-        shell: bash
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-
-          test -x "$JAVA_HOME/bin/java"
-
           timeout 90s godot --headless \
             --path "$PROJECT_DIR" \
             --editor \
             --script "$PROJECT_DIR/.ci/configure_android.gd"
 
-          echo "Android paths configured"
+          echo "Android configuration finished"
 
-      - name: Create debug signing key
+      - name: Generate debug keystore
         shell: bash
-        timeout-minutes: 2
         run: |
           set -euo pipefail
 
@@ -233,8 +217,6 @@ jobs:
             --path "$PROJECT_DIR" \
             --editor --import --quit
 
-          echo "Resources imported"
-
       - name: Export Android APK
         shell: bash
         timeout-minutes: 10
@@ -243,21 +225,42 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/build"
 
-          timeout 540s godot --headless \
+          echo "Starting Android export with verbose logging"
+
+          set +e
+          timeout 540s godot --headless --verbose \
             --path "$PROJECT_DIR" \
             --export-debug "Android" \
-            "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
+            "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build/export.log"
 
-          test -s \
-            "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
+          RESULT=${PIPESTATUS[0]}
+          set -e
 
-          echo "APK successfully created"
+          if [ "$RESULT" -ne 0 ]; then
+            echo "::error::Godot export failed with code $RESULT"
+            exit "$RESULT"
+          fi
+
+          test -s "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
+
+          echo "APK successfully built"
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: GoblinDefense-Android-APK
           path: build/GoblinDefense-debug.apk
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload diagnostic log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoblinDefense-Build-Log
+          path: build/export.log
+          if-no-files-found: ignore
           retention-days: 7
           

@@ -72,28 +72,36 @@ jobs:
           test -f "$PROJECT_DIR/scenes/main.tscn"
           test -f "$PROJECT_DIR/scripts/game.gd"
           test -f "$PROJECT_DIR/export_presets.cfg"
+          test -f "$PROJECT_DIR/.ci/configure_android.gd"
 
-          echo "Godot project found: $PROJECT_DIR"
+          echo "Godot project: $PROJECT_DIR"
 
       - name: Configure Android SDK
         shell: bash
         run: |
           set -euo pipefail
 
-          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK"
 
           yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" \
             --licenses >/dev/null || true
 
           "$SDK/cmdline-tools/latest/bin/sdkmanager" \
             "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "cmdline-tools;latest" \
+            "cmake;3.10.2.4988404" \
+            "ndk;23.2.8568313"
+
+          echo "GODOT_CI_ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
 
       - name: Install Godot 4.4.1
         shell: bash
         run: |
           set -euo pipefail
+
           VERSION=4.4.1
 
           wget -q \
@@ -119,9 +127,23 @@ jobs:
           cp /tmp/godot_templates/templates/* \
             "$HOME/.local/share/godot/export_templates/${VERSION}.stable/"
 
+      - name: Configure Godot Android paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x "$JAVA_HOME/bin/java"
+
+          godot --headless \
+            --path "$PROJECT_DIR" \
+            --editor \
+            --script "$PROJECT_DIR/.ci/configure_android.gd"
+
       - name: Create debug signing key
         shell: bash
         run: |
+          set -euo pipefail
+
           keytool -genkeypair -noprompt \
             -keystore "$RUNNER_TEMP/debug.keystore" \
             -alias androiddebugkey \
@@ -136,13 +158,16 @@ jobs:
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
           echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
 
-      - name: Import Godot resources
+      - name: Import game resources
+        shell: bash
         run: |
+          set -euo pipefail
+
           godot --headless \
             --path "$PROJECT_DIR" \
             --editor --import --quit
 
-      - name: Build Android APK
+      - name: Export Android APK
         shell: bash
         run: |
           set -euo pipefail
@@ -151,7 +176,7 @@ jobs:
 
           godot --headless \
             --path "$PROJECT_DIR" \
-            --export-debug Android \
+            --export-debug "Android" \
             "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
 
           test -s build/GoblinDefense-debug.apk

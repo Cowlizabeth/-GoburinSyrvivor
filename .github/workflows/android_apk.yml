@@ -4,11 +4,15 @@ name: Goblin Defense Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
 
 jobs:
   android:
+    name: Build Android APK
     runs-on: ubuntu-22.04
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -44,7 +48,7 @@ jobs:
             for archive in "${ZIPS[@]}"; do
               if unzip -Z1 "$archive" |
                 grep -Eq '(^|/)project\.godot$'; then
-
+                echo "Extracting: $archive"
                 unzip -oq "$archive" \
                   -d /tmp/goblin_projects
                 break
@@ -59,7 +63,7 @@ jobs:
           fi
 
           if [ "${#PROJECTS[@]}" -ne 1 ]; then
-            echo "::error::Expected one Godot project, found ${#PROJECTS[@]}"
+            echo "::error::Expected one project.godot, found ${#PROJECTS[@]}"
             exit 1
           fi
 
@@ -74,20 +78,23 @@ jobs:
           test -f "$PROJECT_DIR/export_presets.cfg"
           test -f "$PROJECT_DIR/.ci/configure_android.gd"
 
-          echo "Godot project: $PROJECT_DIR"
+          echo "Godot project found: $PROJECT_DIR"
 
       - name: Configure Android SDK
         shell: bash
+        timeout-minutes: 5
         run: |
           set -euo pipefail
 
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           test -n "$SDK"
 
-          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" \
-            --licenses >/dev/null || true
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
 
-          "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
@@ -99,6 +106,7 @@ jobs:
 
       - name: Install Godot 4.4.1
         shell: bash
+        timeout-minutes: 5
         run: |
           set -euo pipefail
 
@@ -127,20 +135,27 @@ jobs:
           cp /tmp/godot_templates/templates/* \
             "$HOME/.local/share/godot/export_templates/${VERSION}.stable/"
 
+          godot --headless --version
+
       - name: Configure Godot Android paths
         shell: bash
+        timeout-minutes: 2
         run: |
           set -euo pipefail
 
           test -x "$JAVA_HOME/bin/java"
+          test -f "$PROJECT_DIR/.ci/configure_android.gd"
 
-          godot --headless \
+          timeout 90s godot --headless \
             --path "$PROJECT_DIR" \
             --editor \
             --script "$PROJECT_DIR/.ci/configure_android.gd"
 
+          echo "Android paths configured"
+
       - name: Create debug signing key
         shell: bash
+        timeout-minutes: 2
         run: |
           set -euo pipefail
 
@@ -160,26 +175,32 @@ jobs:
 
       - name: Import game resources
         shell: bash
+        timeout-minutes: 3
         run: |
           set -euo pipefail
 
-          godot --headless \
+          timeout 150s godot --headless \
             --path "$PROJECT_DIR" \
             --editor --import --quit
 
+          echo "Resources imported"
+
       - name: Export Android APK
         shell: bash
+        timeout-minutes: 10
         run: |
           set -euo pipefail
 
-          mkdir -p build
+          mkdir -p "$GITHUB_WORKSPACE/build"
 
-          godot --headless \
+          timeout 540s godot --headless \
             --path "$PROJECT_DIR" \
             --export-debug "Android" \
             "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
 
-          test -s build/GoblinDefense-debug.apk
+          test -s "$GITHUB_WORKSPACE/build/GoblinDefense-debug.apk"
+
+          echo "APK successfully created"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -187,4 +208,5 @@ jobs:
           name: GoblinDefense-Android-APK
           path: build/GoblinDefense-debug.apk
           if-no-files-found: error
+          retention-days: 7
           
